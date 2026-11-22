@@ -12,7 +12,7 @@ import streamlit as st
 
 from run_review import INSTRUCTIONS, request_review
 from similarity import BLACK, WHITE, classify, score
-from validation import FILE_COUNT, sample_file, validate
+from validation import FILE_COUNT, sample_bytes, sample_name, validate
 
 PAGE = Path(__file__).with_name("index.html")
 MAX_LENGTH = 30_000
@@ -245,8 +245,7 @@ def validation_panel():
     next_file = next((number for number in range(1, FILE_COUNT + 1) if number not in completed), None)
     st.progress(len(history) / FILE_COUNT, text=f"검증 완료 {len(history)}/{FILE_COUNT}개")
     if next_file is not None:
-        path = sample_file(next_file)
-        st.download_button("다음 검증 파일 받기", path.read_bytes(), path.name, mime="text/csv")
+        st.download_button("다음 검증 파일 받기", sample_bytes(next_file), sample_name(next_file), mime="text/csv")
         st.caption("검증 버튼을 누르면 이 파일의 가상 문장만 OpenAI API로 전송돼요. 정답 라벨은 전송하지 않으며, 요청당 API 비용이 발생할 수 있어요.")
         if st.button(f"파일 {next_file:02} 검증", key="validate-next"):
             try:
