@@ -1,6 +1,8 @@
 """Streamlit entry point for the consent checker."""
 from hashlib import sha256
 from html import escape
+import csv
+from io import StringIO
 import json
 from pathlib import Path
 import subprocess
@@ -9,6 +11,7 @@ from urllib.error import HTTPError, URLError
 import streamlit as st
 
 from run_review import INSTRUCTIONS, request_review
+from similarity import BLACK, WHITE, BENCHMARK, classify, metrics, score
 
 PAGE = Path(__file__).with_name("index.html")
 MAX_LENGTH = 30_000
@@ -61,9 +64,16 @@ REVIEW_FIELDS = {
 REVIEW_FORMAT = {
     "type": "json_schema", "name": "consent_review", "strict": True,
     "schema": {
-        "type": "object", "additionalProperties": False, "required": ["summary", "findings"],
+        "type": "object", "additionalProperties": False, "required": ["summary", "findings", "judgments"],
         "properties": {
             "summary": {"type": "string"},
+            "judgments": {"type": "array", "items": {
+                "type": "object", "additionalProperties": False, "required": ["line", "label"],
+                "properties": {
+                    "line": {"type": "integer"},
+                    "label": {"type": "string", "enum": ["위험", "안전", "판단 유보"]},
+                },
+            }},
             "findings": {"type": "array", "items": {
                 "type": "object", "additionalProperties": False,
                 "required": list(REVIEW_FIELDS), "properties": REVIEW_FIELDS,
@@ -79,11 +89,21 @@ findings는 중요한 것부터 최대 6개만 남긴다. 위험은 동의 간�
 title은 짧게, why와 fix는 각각 한 문장으로 쓰고 fix는 바로 할 수 있는 수정 행동을 말한다.
 quote는 해당 줄에서 그대로 옮긴 짧은 구절이어야 한다. 누락이거나 개인 식별값이 포함되어 있으면
 quote를 비우고 관련 구역의 line을 쓴다. 해당 줄이 아예 없으면 line은 0으로 쓴다.
+judgments에는 아래 별도로 지정되는 원문 행 번호 각각에 대해 label을 하나씩 쓴다.
+위험은 해당 표현 자체에 구체적인 문제 신호가 있을 때, 안전은 해당 문장에 위험 신호가 보이지 않을 때,
+판단 유보는 문맥이 부족하거나 판단이 모호할 때 쓴다. 고지 누락을 제목 행의 위험으로 분류하지 않는다.
 """
 
 
+def comparison_lines(document):
+    return [(i, line.strip()) for i, line in enumerate(document.splitlines(), 1)
+            if line.strip() and not (line.strip().startswith("[") and line.strip().endswith("]"))]
+
+
 def gpt_review(document, key):
-    response = request_review(document, key, instructions=REVIEW_INSTRUCTIONS, response_format=REVIEW_FORMAT)
+    target_lines = {line for line, _ in comparison_lines(document)[:50]}
+    instructions = REVIEW_INSTRUCTIONS + "\njudgments 대상 행 번호: " + ", ".join(map(str, sorted(target_lines)))
+    response = request_review(document, key, instructions=instructions, response_format=REVIEW_FORMAT)
     result = json.loads(response["review"])
     lines = document.splitlines()
     for finding in result["findings"]:
@@ -93,6 +113,15 @@ def gpt_review(document, key):
             finding["quote"] = ""
         elif finding["quote"] not in lines[line - 1]:
             finding["quote"] = ""
+    judgments = {}
+    duplicate_lines = set()
+    for decision in result["judgments"]:
+        line = decision["line"]
+        if line in judgments:
+            duplicate_lines.add(line)
+        if line in target_lines:
+            judgments[line] = decision["label"]
+    result["judgments"] = {line: label for line, label in judgments.items() if line not in duplicate_lines}
     return result
 
 
@@ -151,6 +180,93 @@ def render_review(result, label):
         )
         report.append("\n".join(filter(None, [f"[{level}] {item['title']}", source, item["why"], item["fix"], item.get("law")])))
     return "\n\n".join(report)
+
+
+def comparison_panel(document, results):
+    st.subheader("같은 문장, 두 가지 판단")
+    st.caption("안전은 해당 문장에서 위험 신호를 찾지 못했다는 뜻이에요. 고지 누락과 실제 동의 절차는 위 결과에서 따로 확인하세요.")
+    threshold = st.slider("유사도 임계값", 0.05, 0.80, 0.20, 0.05, format="%.2f")
+    st.caption("화이트리스트와 블랙리스트의 최고 유사도 중 더 높은 값이 임계값에 도달하면 해당 쪽으로 분류해요. 둘 다 낮거나 동점이면 판단을 유보해요.")
+    lines = comparison_lines(document)
+    if not lines:
+        st.info("동의서 원문을 입력하면 문장별 유사도를 볼 수 있어요.")
+    else:
+        gpt = results.get("gpt", {}).get("judgments", {})
+        rows = []
+        evidence = []
+        for (line_number, sentence), (white, black, white_example, black_example) in zip(lines, score([text for _, text in lines])):
+            label = classify(white, black, threshold)
+            gpt_label = gpt.get(line_number, "미평가")
+            rows.append({
+                "행": line_number, "원문": sentence, "유사도 판단": label, "GPT 판단": gpt_label,
+                "화이트 최고": round(white, 3), "블랙 최고": round(black, 3),
+            })
+            evidence.append({"행": line_number, "화이트 근접 예시": white_example if white else "", "블랙 근접 예시": black_example if black else ""})
+        matched, different, pending = [], [], []
+        for row in rows:
+            a, b = row["유사도 판단"], row["GPT 판단"]
+            if a not in ("위험", "안전") or b not in ("위험", "안전"):
+                pending.append(row)
+            elif a == b:
+                matched.append(row)
+            else:
+                different.append(row)
+        if "gpt" not in results:
+            st.info("GPT 방식 실행을 누르면 두 방식이 같게 또는 다르게 본 문장이 여기에 표시돼요.")
+        elif len(lines) > 50:
+            st.caption("GPT의 문장별 비교는 앞 50개 행까지만 요청했어요.")
+        for tab, group in zip(st.tabs([f"다르게 판단 {len(different)}", f"같게 판단 {len(matched)}", f"유보·미평가 {len(pending)}"]), [different, matched, pending]):
+            with tab:
+                if group:
+                    st.dataframe(group, hide_index=True, width="stretch")
+                else:
+                    st.caption("해당 문장이 없어요.")
+        with st.expander("문장별로 가장 닮은 기준 예시"):
+            st.dataframe(evidence, hide_index=True, width="stretch")
+
+    with st.expander("화이트리스트·블랙리스트 보기"):
+        white, black = st.columns(2)
+        with white:
+            st.markdown("**화이트리스트 · 안전 예시**")
+            for example in WHITE:
+                st.text(example)
+        with black:
+            st.markdown("**블랙리스트 · 위험 예시**")
+            for example in BLACK:
+                st.text(example)
+    accuracy_panel(threshold)
+
+
+def accuracy_panel(selected):
+    st.subheader("임계값별 유사도 정확도")
+    st.caption("기본 그래프는 기준 목록과 별도로 만든 테스트용 문장 20개(안전 10개, 위험 10개) 결과예요. 판단 유보도 전체 분모에 포함해요.")
+    examples = BENCHMARK
+    uploaded = st.file_uploader("내 검증 데이터로 바꾸기 · 선택", type=["csv"], help="UTF-8 CSV. 첫 줄은 sentence,label이고, label은 안전 또는 위험이에요.")
+    if uploaded:
+        try:
+            if uploaded.size > 2_000_000:
+                raise ValueError
+            reader = csv.DictReader(StringIO(uploaded.getvalue().decode("utf-8-sig")))
+            if not {"sentence", "label"}.issubset(reader.fieldnames or []):
+                raise ValueError
+            examples = [((row["sentence"] or "").strip(), (row["label"] or "").strip()) for row in reader]
+            references = set(WHITE + BLACK)
+            if not 1 <= len(examples) <= 10000 or any(
+                not sentence or sentence in references or label not in ("안전", "위험")
+                for sentence, label in examples
+            ):
+                raise ValueError
+        except ValueError:
+            st.error("기준 목록과 겹치지 않는 문장을 담은 UTF-8 CSV를 올려주세요. 열은 sentence,label, 라벨은 안전 또는 위험, 최대 10,000행이에요.")
+            return
+        st.caption(f"업로드한 라벨 데이터 {len(examples):,}개로 계산했어요. 검증 CSV는 GPT에 전송하지 않아요.")
+    thresholds = [round(i / 100, 2) for i in range(5, 81, 5)]
+    values = list(metrics(examples, thresholds))
+    selected_row = next(row for row in values if abs(row["임계값"] - selected) < 0.001)
+    st.metric(f"임계값 {selected:.2f} 정확도", f"{selected_row['정확도 (%)']:.1f}%")
+    st.line_chart({"임계값": thresholds, "정확도 (%)": [row["정확도 (%)"] for row in values]}, x="임계값", y="정확도 (%)")
+    with st.expander("임계값별 수치 · 오탐, 미탐, 판단 유보"):
+        st.dataframe(values, hide_index=True, width="stretch")
 
 
 st.set_page_config(page_title="Privacy Consent Form Checker", layout="wide")
@@ -249,5 +365,8 @@ with right_panel:
         st.download_button(label + " 결과 TXT 저장", report, f"consent-review-{mode}.txt")
     else:
         st.caption(label + " 실행을 누르면 결과가 표시됩니다.")
+
+st.divider()
+comparison_panel(document, results)
 
 st.caption("위험은 먼저 확인할 항목, 주의는 추가 확인할 항목이에요. 실제 동의 화면과 원문을 함께 확인하세요.")
