@@ -29,22 +29,28 @@ st.caption("TF-IDF·코사인 유사도와 GPT에 같은 검증 파일을 넣어
 
 history = st.session_state.setdefault("research_average_history", [])
 details = st.session_state.setdefault("research_average_details", {})
-with st.expander("유사도 판정 기준과 기준 문장"):
+with st.expander("유사도 판정 기준"):
     st.markdown(
         "TF-IDF로 문장을 벡터로 바꾼 뒤, 코사인 유사도로 비교해요. "
         "화이트리스트 최고 점수가 임계값에 도달하면 안전으로 분류해요. "
         "나머지는 후보로 넘겨 블랙리스트와 비교하고, 블랙리스트 임계값에 도달하면 위험, 그보다 낮으면 판단 유보로 분류해요."
     )
-    st.caption("화이트리스트와 블랙리스트는 시연용으로 각각 12개씩 작성했어요.")
-    a, b = st.columns(2)
-    with a:
-        st.markdown("**화이트리스트 · 안전 예시**")
-        for phrase in WHITE:
-            st.text(phrase)
-    with b:
-        st.markdown("**블랙리스트 · 위험 예시**")
-        for phrase in BLACK:
-            st.text(phrase)
+def reference_list(column, label, description, examples, key):
+    with column:
+        visible = st.session_state.get(key, False)
+        action = "접기" if visible else "보기"
+        st.button(
+            f"{label} {action}", key=f"{key}_button",
+            on_click=st.session_state.__setitem__, args=(key, not visible),
+        )
+        if visible:
+            st.caption(f"{description} · 시연용 {len(examples)}개")
+            st.markdown("\n".join(f"{i}. {phrase}" for i, phrase in enumerate(examples, 1)))
+
+
+white_column, black_column = st.columns(2)
+reference_list(white_column, "화이트리스트", "안전 기준 문장", WHITE, "show_whitelist")
+reference_list(black_column, "블랙리스트", "위험 기준 문장", BLACK, "show_blacklist")
 
 st.markdown("**유사도 검증 임계값 · 20%, 40%, 60%, 80%**")
 st.caption("각 회차에 화이트리스트와 블랙리스트에 같은 임계값을 적용해요. 파일별 유사도 점은 (20% 정확도 + 40% 정확도 + 60% 정확도 + 80% 정확도) ÷ 4예요. GPT는 파일당 한 번 평가해요.")
