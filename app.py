@@ -12,7 +12,7 @@ import streamlit as st
 
 from run_review import INSTRUCTIONS, request_review
 from similarity import BLACK, WHITE, classify, score
-from validation import FILE_COUNT, sample_bytes, sample_name, validate
+from validation import FILE_COUNT, METHODS, SIMILARITY_THRESHOLD, sample_bytes, sample_name, validate
 
 PAGE = Path(__file__).with_name("index.html")
 MAX_LENGTH = 30_000
@@ -239,8 +239,8 @@ def comparison_panel(document, results):
 
 def validation_panel():
     st.subheader("규칙 방식과 GPT 방식의 정확도")
-    st.caption("검증 파일마다 정답 라벨이 있는 가상 문장 100개(안전 50개, 위험 50개)를 비교해요. 같은 문장 유형에 상황을 바꿔 만든 데이터이며, 문장 자체의 위험 신호만 평가해요.")
-    history = st.session_state.setdefault("validation_history", [])
+    st.caption("검증 파일마다 정답 라벨이 있는 가상 문장 100개(안전 50개, 위험 50개)를 비교해요. 상황과 표현을 바꾼 예시로 문장 자체의 위험 신호를 평가해요.")
+    history = st.session_state.setdefault("validation_history_v2", [])
     completed = {item["파일 번호"] for item in history}
     next_file = next((number for number in range(1, FILE_COUNT + 1) if number not in completed), None)
     st.progress(len(history) / FILE_COUNT, text=f"검증 완료 {len(history)}/{FILE_COUNT}개")
@@ -256,7 +256,7 @@ def validation_panel():
                 st.info("Streamlit Secrets에 OpenAI API 키가 필요해요.")
             else:
                 try:
-                    with st.spinner(f"파일 {next_file:02}의 문장 100개를 두 방식으로 검증하고 있어요…"):
+                    with st.spinner(f"파일 {next_file:02}의 문장 100개를 세 방식으로 검증하고 있어요…"):
                         row = validate(next_file, key, rule_engine())
                 except HTTPError as error:
                     st.error(api_error_message(error))
@@ -265,20 +265,25 @@ def validation_panel():
                 else:
                     history.append(row)
                     st.rerun()
-    st.caption("정확도 = 정답과 일치한 문장 수 ÷ 100. 두 방식의 결과가 모두 도착해야 점이 추가돼요. 결과는 현재 앱 세션 동안 유지돼요.")
+    st.caption("정확도 = 정답과 일치한 문장 수 ÷ 100. 세 방식의 결과가 모두 도착해야 점이 추가돼요. 결과는 현재 앱 세션 동안 유지돼요.")
     if not history:
-        st.info("첫 번째 파일을 검증하면 두 방식의 첫 점이 표시돼요.")
+        st.info("첫 번째 파일을 검증하면 정확도 점이 표시돼요.")
         return
     table = pd.DataFrame(history).sort_values("파일 번호")
-    chart_data = table.melt(id_vars=["파일 번호"], var_name="검사 방식", value_name="정확도 (%)")
+    show_similarity = st.checkbox(f"화이트리스트·블랙리스트 유사도도 표시 · 임계값 {SIMILARITY_THRESHOLD:.2f}", value=True)
+    methods = METHODS if show_similarity else METHODS[:2]
+    chart_data = table.melt(id_vars=["파일 번호"], value_vars=methods, var_name="검사 방식", value_name="정확도 (%)")
     chart = alt.Chart(chart_data).mark_line(point=alt.OverlayMarkDef(filled=True, size=80)).encode(
         x=alt.X("파일 번호:Q", scale=alt.Scale(domain=[1, FILE_COUNT]), axis=alt.Axis(values=list(range(1, FILE_COUNT + 1)))),
         y=alt.Y("정확도 (%):Q", scale=alt.Scale(domain=[0, 100])),
-        color=alt.Color("검사 방식:N", scale=alt.Scale(domain=["규칙 방식", "GPT 방식"], range=["#235aa6", "#aa4d14"])),
+        color=alt.Color("검사 방식:N", scale=alt.Scale(domain=methods, range=["#235aa6", "#aa4d14", "#167567"][:len(methods)])),
         tooltip=["파일 번호", "검사 방식", "정확도 (%)"],
     )
     st.altair_chart(chart, use_container_width=True)
-    st.dataframe(table, hide_index=True, width="stretch")
+    st.dataframe(table[["파일 번호", *methods]], hide_index=True, width="stretch")
+    with st.expander("오탐 · 미탐 · 판단 유보"):
+        st.caption("오탐은 안전 문장을 위험으로 표시한 수, 미탐은 위험 문장을 놓친 수예요. 유사도 방식에서 위험 문장을 유보한 경우는 미탐에도 포함하며, 모든 유보는 정확도에서 오답으로 계산해요.")
+        st.dataframe(table.drop(columns=METHODS), hide_index=True, width="stretch")
     st.download_button("검증 결과 CSV 저장", table.to_csv(index=False).encode("utf-8-sig"), "accuracy-results.csv", mime="text/csv")
 
 

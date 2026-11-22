@@ -4,12 +4,11 @@ from io import StringIO
 from itertools import product
 from random import Random
 import json
-from pathlib import Path
 import subprocess
 
 from run_review import request_review
+from similarity import classify, score
 
-DIRECTORY = Path(__file__).with_name("validation")
 CONTEXTS = ["상담", "예약", "배송", "수리", "교육", "행사", "채용", "진료", "구독", "대여", "설문", "공연", "시설 이용", "고객 지원", "체험", "검진", "모임", "방문", "상담회", "입장"]
 VARIANTS = ["웹 신청", "전화 신청", "앱 신청", "현장 신청", "온라인 신청"]
 SAFE = [
@@ -36,6 +35,32 @@ RISK = [
     "{case} 신청자의 연락처를 추가 안내 없이 관계사의 상품 홍보에 쓸 수 있습니다.",
     "{case}에서 여권번호 처리에 관한 별도 동의 없이 번호를 받습니다.",
 ]
+SAFE_ALTERNATIVES = [
+    "신청 기록은 {case}가 끝나는 날부터 한 달이 지나면 지웁니다.",
+    "{case}에 쓰는 연락 수단은 신청자가 알려준 이메일로 한정합니다.",
+    "{case}에서 선택 항목을 비워도 신청할 수 있습니다.",
+    "{case}에서 회신이 없으면 동의한 것으로 간주하지 않습니다.",
+    "{case}는 법정대리인이 동의했는지 확인한 뒤에만 어린이 신청을 받습니다.",
+    "{case}에서는 민감정보 중 진료 이력의 이용 여부를 다른 항목과 나누어 선택합니다.",
+    "{case}를 신청할 때 광고 수신 여부는 별도의 항목에서 선택합니다.",
+    "{case} 신청에 개인정보 제공을 원치 않으면 동의하지 않을 수 있습니다.",
+    "{case} 신청 메일은 신청 결과를 전달하는 데만 씁니다.",
+    "{case}에서 고유식별정보를 처리할 때에는 별도 동의를 받습니다.",
+]
+RISK_ALTERNATIVES = [
+    "{case}에 이의를 제기하지 않은 이용자는 정보 제공을 허락한 것으로 봅니다.",
+    "{case}가 끝나도 정보의 삭제 시점을 정하지 않습니다.",
+    "{case}에서 받은 개인정보는 필요 시까지 보유합니다.",
+    "{case} 제공받는 자: 관계사",
+    "{case}에 참여하는 초등학생은 보호자 승인 없이 개인정보 제공을 선택할 수 있습니다.",
+    "{case}에 필요한 진료기록 이용에는 회원 가입 동의 하나만 받습니다.",
+    "{case} 이용자는 광고를 계속 받겠다고 선택해야 서비스를 이용할 수 있습니다.",
+    "{case} 신청과 관련이 없는 가족의 연락처까지 필수로 받습니다.",
+    "{case}에서 받은 전화번호를 별도 고지 없이 다른 목적으로 사용합니다.",
+    "{case}에 필요한 고유식별정보는 별도의 동의 없이 일괄 수집합니다.",
+]
+SIMILARITY_THRESHOLD = 0.20
+METHODS = ["규칙 방식", "GPT 방식", "유사도 방식"]
 FILE_COUNT = len(CONTEXTS)
 GPT_FORMAT = {
     "type": "json_schema", "name": "validation_predictions", "strict": True,
@@ -66,22 +91,22 @@ def sample_name(number):
 
 
 def sample_bytes(number):
-    name = sample_name(number)
-    try:
-        return (DIRECTORY / name).read_bytes()
-    except FileNotFoundError:
-        context = CONTEXTS[number - 1]
-        rows = [
-            (template.format(case=f"{context} {variant}"), label)
-            for label, templates in [("안전", SAFE), ("위험", RISK)]
-            for template, variant in product(templates, VARIANTS)
+    sample_name(number)
+    context = CONTEXTS[number - 1]
+    rng = Random(number)
+    rows = [
+        (rng.choice(phrases).format(case=f"{context} {variant}"), label)
+        for label, originals, alternatives in [
+            ("안전", SAFE, SAFE_ALTERNATIVES), ("위험", RISK, RISK_ALTERNATIVES)
         ]
-        Random(number).shuffle(rows)
-        buffer = StringIO(newline="")
-        writer = csv.writer(buffer)
-        writer.writerow(["sentence", "label"])
-        writer.writerows(rows)
-        return buffer.getvalue().encode("utf-8-sig")
+        for phrases, variant in product(zip(originals, alternatives), VARIANTS)
+    ]
+    rng.shuffle(rows)
+    buffer = StringIO(newline="")
+    writer = csv.writer(buffer)
+    writer.writerow(["sentence", "label"])
+    writer.writerows(rows)
+    return buffer.getvalue().encode("utf-8-sig")
 
 
 def load_examples(number):
@@ -119,12 +144,18 @@ def validate(number, key, engine):
     examples = load_examples(number)
     sentences = [row["sentence"] for row in examples]
     truth = [row["label"] for row in examples]
-    rules = rules_predictions(sentences, engine)
-    gpt = gpt_predictions(sentences, key)
-    if len(rules) != len(truth):
-        raise ValueError("Incomplete rule predictions")
-    return {
-        "파일 번호": number,
-        "규칙 방식": 100 * sum(a == b for a, b in zip(truth, rules)) / len(truth),
-        "GPT 방식": 100 * sum(a == b for a, b in zip(truth, gpt)) / len(truth),
-    }
+    predictions = [
+        rules_predictions(sentences, engine),
+        gpt_predictions(sentences, key),
+        [classify(white, black, SIMILARITY_THRESHOLD) for white, black, *_ in score(sentences)],
+    ]
+    result = {"파일 번호": number}
+    for method, labels in zip(METHODS, predictions):
+        if len(labels) != len(truth):
+            raise ValueError("Incomplete predictions")
+        pairs = list(zip(truth, labels))
+        result[method] = 100 * sum(actual == predicted for actual, predicted in pairs) / len(truth)
+        result[f"{method} 오탐"] = pairs.count(("안전", "위험"))
+        result[f"{method} 미탐"] = pairs.count(("위험", "안전")) + pairs.count(("위험", "판단 유보"))
+        result[f"{method} 유보"] = labels.count("판단 유보")
+    return result
