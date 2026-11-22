@@ -124,19 +124,27 @@ points = completed_points(table)
 st.caption("각 점은 해당 20문장의 결과예요. 예를 들어 X축 40의 점은 21~40번 문장을 집계한 값이에요.")
 if points:
     chart_data = pd.DataFrame(points)
+    chart_data["범례"] = chart_data["방식"].map({SIMILARITY: "유사도", GPT: "GPT-5"})
     a, b = st.columns(2)
     for column, metric, title, scale in [
         (a, "정확도", "정확도 (%)", alt.Scale(domain=[0, 100])),
         (b, "문장당 시간(초)", "문장당 평균 처리 시간 (초)", alt.Scale(zero=True)),
     ]:
+        column.markdown(f"**{title}**")
         chart = alt.Chart(chart_data).mark_line(point=alt.OverlayMarkDef(filled=True, size=75)).encode(
-            x=alt.X("완료 문장 수:Q", axis=alt.Axis(values=list(range(BATCH_SIZE, len(examples) + 1, BATCH_SIZE)), format="d"),
+            x=alt.X("완료 문장 수:Q", title=None,
+                    axis=alt.Axis(values=list(range(BATCH_SIZE, len(examples) + 1, BATCH_SIZE)),
+                                  format="d", labelAngle=-45, labelPadding=5, labelOverlap=True),
                     scale=alt.Scale(domain=[BATCH_SIZE, len(examples)], nice=False)),
-            y=alt.Y(f"{metric}:Q", title=title, scale=scale),
-            color=alt.Color("방식:N", scale=alt.Scale(domain=[SIMILARITY, GPT], range=["#235aa6", "#aa4d14"])),
-            tooltip=["완료 문장 수:Q", "방식:N", alt.Tooltip(f"{metric}:Q", format=".4f")],
-        )
-        column.altair_chart(chart.properties(title=title, height=230), use_container_width=True)
+            y=alt.Y(f"{metric}:Q", title=None, scale=scale),
+            color=alt.Color("범례:N", title=None,
+                            legend=alt.Legend(orient="top", direction="horizontal", labelLimit=100, offset=10),
+                            scale=alt.Scale(domain=["유사도", "GPT-5"], range=["#235aa6", "#aa4d14"])),
+            tooltip=["완료 문장 수:Q", "방식:N", alt.Tooltip(f"{metric}:Q", title=title, format=".4f")],
+        ).properties(height=270, padding={"left": 16, "top": 12, "right": 20, "bottom": 16})
+        column.altair_chart(chart, use_container_width=True)
+        column.caption("X축 · 완료 문장 수")
+
 else:
     st.info("첫 20문장의 검증이 끝나면 그래프에 두 방식의 첫 점이 표시돼요.")
 st.caption("전체 검증 완료 문장 기준 누적 집계")
