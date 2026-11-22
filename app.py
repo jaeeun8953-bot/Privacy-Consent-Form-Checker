@@ -27,14 +27,16 @@ st.set_page_config(page_title="개인정보 동의서 검증", layout="wide")
 st.title("개인정보 동의서 위험 문장 검증")
 st.caption("TF-IDF·코사인 유사도와 GPT에 같은 검증 파일을 넣어 비교해요. 파일 20개에 가상 문장 100개씩 있으며, 각각 안전 50개와 위험 50개예요.")
 
-history = st.session_state.setdefault("research_eojeol_history", [])
-details = st.session_state.setdefault("research_eojeol_details", {})
+history = st.session_state.setdefault("research_phrases_history", [])
+details = st.session_state.setdefault("research_phrases_details", {})
 with st.expander("유사도 판정 기준"):
     st.markdown(
-        "입력 문장과 각 기준 어절을 어절 내부의 2~4글자 조각을 쓰는 TF-IDF 벡터로 바꾼 뒤, 코사인 유사도로 비교해요. "
+        "입력 문장과 각 기준 표현을 어절 내부의 2~4글자 조각을 쓰는 TF-IDF 벡터로 바꾼 뒤, 코사인 유사도로 비교해요. "
         "화이트리스트 최고 점수가 임계값에 도달하면 안전으로 분류해요. "
         "나머지는 후보로 넘겨 블랙리스트와 비교하고, 블랙리스트 임계값에 도달하면 위험, 그보다 낮으면 판단 유보로 분류해요."
     )
+    st.caption("제3자 이전 등 일부 표현은 문맥을 추가로 확인할 신호로 사용해요.")
+
 def reference_list(column, label, description, examples, key):
     with column:
         visible = st.session_state.get(key, False)
@@ -44,13 +46,13 @@ def reference_list(column, label, description, examples, key):
             on_click=st.session_state.__setitem__, args=(key, not visible),
         )
         if visible:
-            st.caption(f"{description} · 시연용 어절 {len(examples)}개")
+            st.caption(f"{description} · 시연용 표현 {len(examples)}개")
             st.markdown("\n".join(f"{i}. {phrase}" for i, phrase in enumerate(examples, 1)))
 
 
 white_column, black_column = st.columns(2)
-reference_list(white_column, "화이트리스트", "안전 기준 어절", WHITE, "show_whitelist")
-reference_list(black_column, "블랙리스트", "위험 기준 어절", BLACK, "show_blacklist")
+reference_list(white_column, "화이트리스트", "안전 기준 표현", WHITE, "show_whitelist")
+reference_list(black_column, "블랙리스트", "위험 기준 표현", BLACK, "show_blacklist")
 
 st.markdown("**유사도 검증 임계값 · 20%, 40%, 60%, 80%**")
 st.caption("각 회차에 화이트리스트와 블랙리스트에 같은 임계값을 적용해요. 파일별 유사도 점은 (20% 정확도 + 40% 정확도 + 60% 정확도 + 80% 정확도) ÷ 4예요. GPT는 파일당 한 번 평가해요.")
