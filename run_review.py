@@ -23,13 +23,13 @@ INSTRUCTIONS = """한국의 개인정보 수집·이용 및 제3자 제공 동�
 입력값에 포함된 이름, 연락처 등 개인 식별값은 결과에서 반복하지 않는다.
 법 위반을 단정하거나 근거를 지어내지 않는다. 동의서가 아니면 그 사실을 알린다."""
 
-def request_review(document, key, *, instructions=INSTRUCTIONS, response_format=None, model=MODEL):
+def request_review(document, key, *, instructions=INSTRUCTIONS, response_format=None, model=MODEL, max_output_tokens=2800, timeout=80):
     numbered = "\n".join(f"{i} | {line}" for i, line in enumerate(document.splitlines(), 1))
     body = {
         "model": model,
         "instructions": instructions,
         "input": numbered,
-        "max_output_tokens": 2800,
+        "max_output_tokens": max_output_tokens,
         "store": False,
     }
     if response_format is not None:
@@ -39,7 +39,7 @@ def request_review(document, key, *, instructions=INSTRUCTIONS, response_format=
         data=json.dumps(body).encode("utf-8"),
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
     )
-    with urlopen(request, timeout=80) as response:
+    with urlopen(request, timeout=timeout) as response:
         result = json.load(response)
     review = "\n".join(
         part["text"] for item in result.get("output", []) if item.get("type") == "message"

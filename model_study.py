@@ -56,3 +56,39 @@ def summarize(results):
         "오탐": sum(row["정답"] == "안전" and row["예측"] == "위험" for row in results),
         "미탐": sum(row["정답"] == "위험" and row["예측"] == "안전" for row in results),
     }
+
+
+BATCH_SIZE = 200
+BATCH_PROMPT = PROMPT + """
+입력은 번호가 붙은 JSON 배열이다. 각 문장을 독립적으로 분류하고 입력 id마다 하나의 label을 반환한다.
+모든 입력 문장에 대해 id와 label을 반환한다. 문장 사이의 내용을 합쳐 판단하지 않는다."""
+BATCH_FORMAT = {
+    "type": "json_schema", "name": "sentence_labels", "strict": True,
+    "schema": {"type": "object", "additionalProperties": False, "required": ["results"],
+        "properties": {"results": {"type": "array", "items": {
+            "type": "object", "additionalProperties": False, "required": ["id", "label"],
+            "properties": {"id": {"type": "integer"}, "label": {"type": "string", "enum": list(LABELS)}}}}}},
+}
+
+
+def measure_batch(rows, key):
+    """One API request per group; truth labels stay local. Commit only complete groups."""
+    if not 1 <= len(rows) <= BATCH_SIZE:
+        raise ValueError("묶음 크기는 1~200이어야 합니다.")
+    payload = json.dumps([{"id": i, "sentence": row["sentence"]} for i, row in enumerate(rows)], ensure_ascii=False)
+    start = perf_counter()
+    response = request_review(payload, key, instructions=BATCH_PROMPT, response_format=BATCH_FORMAT,
+                              model=STUDY_MODEL, max_output_tokens=16000, timeout=600)
+    seconds = perf_counter() - start
+    parsed = json.loads(response["review"])["results"]
+    if not isinstance(parsed, list) or len(parsed) != len(rows):
+        raise ValueError("응답 문장 수가 다릅니다.")
+    predictions = {}
+    for item in parsed:
+        index, label = item["id"], item["label"]
+        if type(index) is not int or not 0 <= index < len(rows) or index in predictions or label not in LABELS:
+            raise ValueError("응답 번호나 라벨이 올바르지 않습니다.")
+        predictions[index] = label
+    return [{"원문": row["sentence"], "정답": row["label"], "예측": predictions[i],
+             "응답 시간(초)": seconds / len(rows), "모델": response["model"],
+             "묶음 처리 시간(초)": seconds, "묶음 문장 수": len(rows)} for i, row in enumerate(rows)]
