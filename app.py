@@ -146,20 +146,46 @@ with st.expander("임계값별 정확도 · 오탐 · 미탐 · 유보"):
         {"임계값": f"{percent}%", **metrics(table, f"유사도 {percent}%")} for percent in THRESHOLDS
     ]).drop(columns="문장당 시간(초)"), hide_index=True)
 st.caption("유사도의 오탐·미탐·유보도 네 조건의 평균 건수예요. 판단 유보는 정확도에서 오답으로 집계해요. 위험 문장을 유보하면 미탐에도 포함해요.")
-st.subheader("유형별 결과")
-st.dataframe(pd.DataFrame([
-    {"유형": category, "검증 문장": len(group), "방식": label, **result}
-    for category, group in table.groupby("유형", sort=False)
-    for label, result in [(SIMILARITY, average_similarity(group)), (GPT, metrics(group, "GPT"))]
-]), hide_index=True)
-st.subheader("판단이 갈린 문장과 오탐·미탐")
-percent = st.selectbox("문장별 판정을 볼 임계값", THRESHOLDS, format_func=lambda value: f"{value}%")
-prediction_column = f"유사도 {percent}%"
-different, same, errors = st.tabs(["다르게 판단", "같게 판단", "오탐·미탐·유보"])
-with different:
-    st.dataframe(table[table[prediction_column] != table["GPT"]], hide_index=True)
-with same:
-    st.dataframe(table[table[prediction_column] == table["GPT"]], hide_index=True)
-with errors:
-    st.dataframe(table[(table["정답"] != table[prediction_column]) | (table["정답"] != table["GPT"])], hide_index=True)
-st.download_button("문장별 결과 CSV 저장", table.to_csv(index=False).encode("utf-8-sig"), "pilot-results.csv", mime="text/csv")
+complete_batches = len(table) // BATCH_SIZE
+if complete_batches:
+    st.subheader("20문장 묶음별 상세 결과")
+    batch_number = st.selectbox(
+        "검증 묶음",
+        range(1, complete_batches + 1),
+        index=complete_batches - 1,
+        format_func=lambda n: f"{n}차 · {(n - 1) * BATCH_SIZE + 1}~{n * BATCH_SIZE}번",
+        key=f"pilot_detail_batch_{complete_batches}",
+    )
+    start = (batch_number - 1) * BATCH_SIZE
+    batch = table.iloc[start:start + BATCH_SIZE].copy()
+    batch.insert(0, "문장 번호", range(start + 1, start + len(batch) + 1))
+    st.markdown("**유형별 결과**")
+    st.dataframe(pd.DataFrame([
+        {"유형": category, "검증 문장": len(group), "방식": label, **result}
+        for category, group in batch.groupby("유형", sort=False)
+        for label, result in [(SIMILARITY, average_similarity(group)), (GPT, metrics(group, "GPT"))]
+    ]), hide_index=True)
+    st.markdown("**문장별 판단과 오탐·미탐**")
+    percent = st.selectbox("문장별 유사도 판정을 볼 임계값", THRESHOLDS, format_func=lambda value: f"{value}%")
+    prediction_column = f"유사도 {percent}%"
+    for label, prediction in [("유사도", prediction_column), ("GPT", "GPT")]:
+        batch[f"{label} 오류"] = [
+            "오탐" if actual == "안전" and predicted == "위험"
+            else "미탐 · 판단 유보" if actual == "위험" and predicted == "판단 유보"
+            else "미탐" if actual == "위험" and predicted == "안전"
+            else "판단 유보" if predicted == "판단 유보"
+            else "—"
+            for actual, predicted in zip(batch["정답"], batch[prediction], strict=True)
+        ]
+    columns = ["문장 번호", "유형", "원문", "정답", prediction_column, "유사도 오류", "GPT", "GPT 오류"]
+    different, same, errors = st.tabs(["다르게 판단", "같게 판단", "오탐·미탐·유보"])
+    with different:
+        st.dataframe(batch.loc[batch[prediction_column] != batch["GPT"], columns], hide_index=True)
+    with same:
+        st.dataframe(batch.loc[batch[prediction_column] == batch["GPT"], columns], hide_index=True)
+    with errors:
+        st.dataframe(batch.loc[(batch["정답"] != batch[prediction_column]) | (batch["정답"] != batch["GPT"]), columns], hide_index=True)
+else:
+    st.info("20문장 검증을 마치면 해당 묶음의 유형별 결과와 오탐·미탐 사례를 볼 수 있어요.")
+
+st.download_button("전체 문장별 결과 CSV 저장", table.to_csv(index=False).encode("utf-8-sig"), "pilot-results.csv", mime="text/csv")
