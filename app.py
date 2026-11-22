@@ -27,8 +27,8 @@ st.set_page_config(page_title="개인정보 동의서 검증", layout="wide")
 st.title("개인정보 동의서 위험 문장 검증")
 st.caption("TF-IDF·코사인 유사도와 GPT에 같은 검증 파일을 넣어 비교해요. 파일 20개에 가상 문장 100개씩 있으며, 각각 안전 50개와 위험 50개예요.")
 
-history = st.session_state.setdefault("research_phrases_history", [])
-details = st.session_state.setdefault("research_phrases_details", {})
+history = st.session_state.setdefault("research_100_phrases_history", [])
+details = st.session_state.setdefault("research_100_phrases_details", {})
 with st.expander("유사도 판정 기준"):
     st.markdown(
         "입력 문장과 각 기준 표현을 어절 내부의 2~4글자 조각을 쓰는 TF-IDF 벡터로 바꾼 뒤, 코사인 유사도로 비교해요. "
