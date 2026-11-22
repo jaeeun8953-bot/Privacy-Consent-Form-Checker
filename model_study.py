@@ -6,6 +6,8 @@ from time import perf_counter
 
 from run_review import request_review
 
+STUDY_MODEL = "gpt-5"
+
 LABELS = ("안전", "위험")
 FORMAT = {
     "type": "json_schema", "name": "sentence_label", "strict": True,
@@ -37,7 +39,7 @@ def parse_csv(data):
 
 def measure(row, key, instructions=PROMPT):
     start = perf_counter()
-    response = request_review(row["sentence"], key, instructions=instructions, response_format=FORMAT)
+    response = request_review(row["sentence"], key, instructions=instructions, response_format=FORMAT, model=STUDY_MODEL)
     seconds = perf_counter() - start
     prediction = json.loads(response["review"])["label"]
     if prediction not in LABELS:
