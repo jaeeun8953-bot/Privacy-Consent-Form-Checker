@@ -7,8 +7,20 @@ from pathlib import Path
 from urllib.error import HTTPError
 
 import pandas as pd
+import altair as alt
+import vl_convert as vlc
 import streamlit as st
 from model_study import STUDY_MODEL, PROMPT, BATCH_PROMPT, BATCH_SIZE, measure_batch, parse_csv, summarize
+
+def graph_downloads(chart, filename):
+    """Export the same Vega-Lite spec displayed on screen without another API call."""
+    spec = chart.to_dict()
+    a, b = st.columns(2)
+    a.download_button("PNG 이미지 저장", vlc.vegalite_to_png(spec, scale=2),
+                      filename + ".png", "image/png", key=filename + "_png", on_click="ignore")
+    b.download_button("SVG 이미지 저장", vlc.vegalite_to_svg(spec).encode("utf-8"),
+                      filename + ".svg", "image/svg+xml", key=filename + "_svg", on_click="ignore")
+
 
 st.set_page_config(page_title="개인정보 동의서 2,000문장 비교", layout="wide")
 st.title("동일한 2,000문장에서 세 방식 비교")
@@ -80,25 +92,33 @@ if len(results) < len(examples) and st.button("전체 자동 평가 시작" if n
         else: st.rerun()
 if results:
     table = pd.DataFrame(results)
-    st.download_button("문장별 결과 CSV 저장 · 이어하기용", table.to_csv(index=False).encode("utf-8-sig"), "gpt5-original-results.csv", "text/csv")
+    st.download_button("문장별 결과 CSV 저장 · 이어하기용", table.to_csv(index=False).encode("utf-8-sig"), "gpt5-original-results.csv", "text/csv", on_click="ignore")
     stats = summarize(results)
     st.metric("GPT-5 정확도" + (" · 중간 결과" if len(results)<len(examples) else " · 최종"), f"{stats['정확도']:.2f}%")
     st.write(f"오탐 {stats['오탐']}건 · 미탐 {stats['미탐']}건 · 묶음 시간 기준 문장당 평균 {stats['문장당 시간(초)']:.4f}초")
     if is_original and len(results) == len(examples):
         comparison = pd.DataFrame({"방식": ["유사도 기반", "GPT-3", "GPT-5"], "정확도 (%)": [68.78, 76.05, stats["정확도"]], "결과 구분": ["기존 실험", "기존 실험", "이번 실측"]})
         st.subheader("동일한 2,000문장 · 분류 정확도 비교")
-        st.bar_chart(comparison, x="방식", y="정확도 (%)", sort=False)
+        accuracy_chart = alt.Chart(comparison).mark_bar().encode(
+            x=alt.X("방식:N", sort=["유사도 기반", "GPT-3", "GPT-5"], title=None),
+            y=alt.Y("정확도 (%):Q", scale=alt.Scale(domain=[0, 100])),
+            color=alt.Color("방식:N", legend=None),
+            tooltip=["방식:N", alt.Tooltip("정확도 (%):Q", format=".2f")],
+        ).properties(width=650, height=350, title="동일한 2,000문장 · 분류 정확도 비교")
+        st.altair_chart(accuracy_chart, use_container_width=True)
+        graph_downloads(accuracy_chart, "three-method-accuracy")
         st.dataframe(comparison, hide_index=True)
         comparison["문장당 평균 처리 시간 (초)"] = [0.02, 59.0, stats["문장당 시간(초)"]]
         st.subheader("처리 시간 비교 · GPT-5는 묶음 처리 환산값")
-        import altair as alt
         speed_chart = alt.Chart(comparison).mark_bar().encode(
             x=alt.X("방식:N", sort=["유사도 기반", "GPT-3", "GPT-5"], title=None),
             y=alt.Y("문장당 평균 처리 시간 (초):Q", scale=alt.Scale(type="log"), title="문장당 평균 처리 시간 (초 · 로그 축)"),
             color=alt.Color("방식:N", legend=None),
             tooltip=["방식:N", alt.Tooltip("문장당 평균 처리 시간 (초):Q", format=".5f"), "결과 구분:N"],
         )
+        speed_chart = speed_chart.properties(width=650, height=350, title="평균 처리 시간 · GPT-5는 200문장 묶음 환산")
         st.altair_chart(speed_chart, use_container_width=True)
+        graph_downloads(speed_chart, "three-method-speed")
         st.dataframe(comparison[["방식", "문장당 평균 처리 시간 (초)", "결과 구분"]], hide_index=True)
         st.caption("시간이 짧을수록 빠릅니다. 차이가 커 로그 축으로 표시했습니다. 유사도 0.02초·GPT-3 59초는 과거 실험 기록, GPT-5는 이번 200문장 묶음 요청의 총 처리 시간을 완료 문장 수로 나눈 값입니다. 단일 문장의 응답 대기 시간이 아닙니다. 측정 시점·환경·호출 조건이 달라 모델 자체의 속도 향상률로 해석하지 않습니다.")
         st.download_button("세 방식 비교 CSV 저장", comparison.to_csv(index=False).encode("utf-8-sig"), "three-method-comparison.csv", "text/csv")
@@ -106,10 +126,18 @@ if results:
     points = [{"완료 문장 수": n, "누적 정확도 (%)": summarize(results[:n])["정확도"]} for n in range(BATCH_SIZE, len(results)+1, BATCH_SIZE)]
     if points:
         st.subheader("GPT-5 누적 정확도")
-        st.line_chart(pd.DataFrame(points), x="완료 문장 수", y="누적 정확도 (%)")
+        accuracy_trend = alt.Chart(pd.DataFrame(points)).mark_line(point=True).encode(
+            x=alt.X("완료 문장 수:Q"), y=alt.Y("누적 정확도 (%):Q", scale=alt.Scale(domain=[0, 100])),
+        ).properties(width=650, height=350, title="GPT-5 누적 정확도")
+        st.altair_chart(accuracy_trend, use_container_width=True)
+        graph_downloads(accuracy_trend, "gpt5-accuracy-trend")
         st.subheader("GPT-5 누적 평균 처리 시간")
         time_points = [{"완료 문장 수": n, "누적 평균 처리 시간 (초)": summarize(results[:n])["문장당 시간(초)"]} for n in range(BATCH_SIZE, len(results)+1, BATCH_SIZE)]
-        st.line_chart(pd.DataFrame(time_points), x="완료 문장 수", y="누적 평균 처리 시간 (초)")
+        speed_trend = alt.Chart(pd.DataFrame(time_points)).mark_line(point=True).encode(
+            x=alt.X("완료 문장 수:Q"), y=alt.Y("누적 평균 처리 시간 (초):Q", scale=alt.Scale(zero=True)),
+        ).properties(width=650, height=350, title="GPT-5 누적 평균 처리 시간 · 묶음 환산")
+        st.altair_chart(speed_trend, use_container_width=True)
+        graph_downloads(speed_trend, "gpt5-speed-trend")
     with st.expander("문장별 결과"):
         st.dataframe(table.drop(columns=["데이터 해시", "평가 설정 해시"]), hide_index=True)
 else: st.info("기본 원본 2,000문장이 준비됐습니다. 전체 자동 평가 시작을 눌러 시작하세요.")
