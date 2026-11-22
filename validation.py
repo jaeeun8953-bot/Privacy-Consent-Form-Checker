@@ -4,7 +4,6 @@ from io import StringIO
 from itertools import product
 from random import Random
 import json
-import subprocess
 
 from run_review import request_review
 from similarity import classify, score
@@ -59,8 +58,7 @@ RISK_ALTERNATIVES = [
     "{case}에서 받은 전화번호를 별도 고지 없이 다른 목적으로 사용합니다.",
     "{case}에 필요한 고유식별정보는 별도의 동의 없이 일괄 수집합니다.",
 ]
-SIMILARITY_THRESHOLD = 0.20
-METHODS = ["규칙 방식", "GPT 방식", "유사도 방식"]
+METHODS = ["TF-IDF + 코사인 유사도", "GPT 방식"]
 FILE_COUNT = len(CONTEXTS)
 GPT_FORMAT = {
     "type": "json_schema", "name": "validation_predictions", "strict": True,
@@ -116,20 +114,6 @@ def load_examples(number):
     return rows
 
 
-def rules_predictions(sentences, engine):
-    # A standalone sentence cannot demonstrate document-wide missing notices.
-    script = engine + """
-const lines = JSON.parse(require('node:fs').readFileSync(0, 'utf8'));
-const sectionChecks = new Set(['수집·이용 고지 확인', '제3자 제공 고지 확인']);
-process.stdout.write(JSON.stringify(lines.map(line =>
-    analyze(line).checks.some(check => !sectionChecks.has(check.title)) ? '위험' : '안전'
-)));
-"""
-    response = subprocess.run(["node", "-e", script], input=json.dumps(sentences),
-                              encoding="utf-8", capture_output=True, check=True, timeout=15)
-    return json.loads(response.stdout)
-
-
 def gpt_predictions(sentences, key):
     response = request_review("\n".join(sentences), key, instructions=INSTRUCTIONS, response_format=GPT_FORMAT)
     entries = json.loads(response["review"])["predictions"]
@@ -140,22 +124,28 @@ def gpt_predictions(sentences, key):
     return [labels[i] for i in range(1, len(sentences) + 1)]
 
 
-def validate(number, key, engine):
+def validate(number, key, white_threshold, black_threshold):
     examples = load_examples(number)
     sentences = [row["sentence"] for row in examples]
     truth = [row["label"] for row in examples]
-    predictions = [
-        rules_predictions(sentences, engine),
-        gpt_predictions(sentences, key),
-        [classify(white, black, SIMILARITY_THRESHOLD) for white, black, *_ in score(sentences)],
+    similarities = score(sentences)
+    similarity_labels = [
+        classify(white, black, white_threshold, black_threshold)
+        for white, black, *_ in similarities
     ]
-    result = {"파일 번호": number}
-    for method, labels in zip(METHODS, predictions):
-        if len(labels) != len(truth):
-            raise ValueError("Incomplete predictions")
+    gpt = gpt_predictions(sentences, key)
+    result = {"파일 번호": number, "화이트 임계값": white_threshold, "블랙 임계값": black_threshold}
+    for method, labels in zip(METHODS, (similarity_labels, gpt)):
         pairs = list(zip(truth, labels))
         result[method] = 100 * sum(actual == predicted for actual, predicted in pairs) / len(truth)
         result[f"{method} 오탐"] = pairs.count(("안전", "위험"))
         result[f"{method} 미탐"] = pairs.count(("위험", "안전")) + pairs.count(("위험", "판단 유보"))
         result[f"{method} 유보"] = labels.count("판단 유보")
-    return result
+    details = [
+        {"행": i, "원문": text, "정답": actual, "유사도 판단": similarity, "GPT 판단": label,
+         "화이트 최고": round(scores[0], 3), "블랙 최고": round(scores[1], 3)}
+        for i, (text, actual, similarity, label, scores) in enumerate(
+            zip(sentences, truth, similarity_labels, gpt, similarities), 1
+        )
+    ]
+    return result, details
