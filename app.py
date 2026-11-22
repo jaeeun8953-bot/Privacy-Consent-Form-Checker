@@ -14,6 +14,7 @@ import streamlit as st
 from model_study import STUDY_MODEL, measure, summarize
 from similarity import BLACK, WHITE, classify, reference_vectors, score
 
+BATCH_SIZE = 20
 THRESHOLDS = (20, 40, 60, 80)
 SIMILARITY = "TF-IDF + 코사인 유사도"
 GPT = "GPT-5"
@@ -69,8 +70,7 @@ results = st.session_state.pilot_results
 st.caption("유사도 정확도는 화이트·블랙 공통 임계값 20·40·60·80%에서 각각 채점한 뒤 네 값의 평균으로 표시해요.")
 progress = st.progress(len(results) / len(examples), text=f"{len(results)}/{len(examples)}문장 검증 완료")
 if len(results) < len(examples):
-    batch = st.selectbox("한 번에 검증할 문장 수", [5, 10, 20], index=1)
-    count = min(batch, len(examples) - len(results))
+    count = min(BATCH_SIZE - len(results) % BATCH_SIZE, len(examples) - len(results))
     st.caption("가상 문장만 문장당 한 번 API에 보내요. 정답 라벨은 앱에서 채점하며 API 이용료가 발생할 수 있어요.")
     if st.button(f"다음 {count}문장 검증", type="primary"):
         try:
@@ -81,36 +81,65 @@ if len(results) < len(examples):
             st.warning("Streamlit Secrets의 OPENAI_API_KEY를 확인해 주세요.")
         else:
             try:
+                reference_vectors()
                 for sample in examples[len(results):len(results) + count]:
                     result = measure(sample, key)
                     results.append({"원문": result["원문"], "정답": result["정답"], "GPT": result["예측"],
                                     "GPT 시간(초)": result["응답 시간(초)"], "응답 모델": result["모델"],
-                                    "유형": sample["category"], "문장 쌍": sample["pair_id"]})
+                                    "유형": sample["category"], "문장 쌍": sample["pair_id"],
+                                    **measure_similarity(sample["sentence"])})
                     progress.progress(len(results) / len(examples), text=f"{len(results)}/{len(examples)}문장 검증 완료")
             except (HTTPError, OSError, ValueError, KeyError) as error:
                 st.error(f"검증이 중단됐어요 ({getattr(error, 'code', type(error).__name__)}). 남은 문장부터 이어갈 수 있어요.")
+            else:
+                st.rerun()
 
 st.subheader("정확도와 문장당 평균 처리 시간")
 if not results:
     st.info("첫 검증을 실행하면 두 방식의 실측 결과가 표시돼요.")
     st.stop()
 reference_vectors()
-table = pd.DataFrame([{**row, **measure_similarity(row["원문"])} for row in results])
+for row in results:
+    if "유사도 시간(초)" not in row:
+        row.update(measure_similarity(row["원문"]))
+table = pd.DataFrame(results)
 summary = pd.DataFrame([
     {"방식": SIMILARITY, **average_similarity(table)},
     {"방식": GPT, **metrics(table, "GPT")},
 ])
 st.caption(f"두 방식이 모두 처리한 {len(table)}문장 기준 · 응답 모델 {results[-1]['응답 모델']}")
 st.caption("유사도는 기준 벡터 준비가 끝난 뒤 문장 하나를 벡터화하고 네 임계값에서 판정하는 전체 시간을 재요. GPT-5는 API 왕복 시간을 재므로 네트워크 시간도 포함돼요.")
-a, b = st.columns(2)
-for column, metric, unit in [(a, "정확도", "%"), (b, "문장당 시간(초)", "초")]:
-    chart = alt.Chart(summary).mark_line(point=True).encode(
-        x=alt.X("방식:N", sort=[SIMILARITY, GPT], axis=alt.Axis(labelAngle=0)),
-        y=alt.Y(f"{metric}:Q", title=f"{metric} ({unit})",
-                scale=alt.Scale(domain=[0, 100]) if unit == "%" else alt.Scale(zero=True)),
-        tooltip=["방식:N", alt.Tooltip(f"{metric}:Q", format=".4f")],
-    )
-    column.altair_chart(chart.properties(height=230), use_container_width=True)
+def completed_points(frame):
+    points = []
+    for end in range(BATCH_SIZE, len(frame) + 1, BATCH_SIZE):
+        batch = frame.iloc[end - BATCH_SIZE:end]
+        points.extend([
+            {"완료 문장 수": end, "방식": SIMILARITY, **average_similarity(batch)},
+            {"완료 문장 수": end, "방식": GPT, **metrics(batch, "GPT")},
+        ])
+    return points
+
+
+points = completed_points(table)
+st.caption("각 점은 해당 20문장의 결과예요. 예를 들어 X축 40의 점은 21~40번 문장을 집계한 값이에요.")
+if points:
+    chart_data = pd.DataFrame(points)
+    a, b = st.columns(2)
+    for column, metric, title, scale in [
+        (a, "정확도", "정확도 (%)", alt.Scale(domain=[0, 100])),
+        (b, "문장당 시간(초)", "문장당 평균 처리 시간 (초)", alt.Scale(zero=True)),
+    ]:
+        chart = alt.Chart(chart_data).mark_line(point=alt.OverlayMarkDef(filled=True, size=75)).encode(
+            x=alt.X("완료 문장 수:Q", axis=alt.Axis(values=list(range(BATCH_SIZE, len(examples) + 1, BATCH_SIZE)), format="d"),
+                    scale=alt.Scale(domain=[BATCH_SIZE, len(examples)], nice=False)),
+            y=alt.Y(f"{metric}:Q", title=title, scale=scale),
+            color=alt.Color("방식:N", scale=alt.Scale(domain=[SIMILARITY, GPT], range=["#235aa6", "#aa4d14"])),
+            tooltip=["완료 문장 수:Q", "방식:N", alt.Tooltip(f"{metric}:Q", format=".4f")],
+        )
+        column.altair_chart(chart.properties(title=title, height=230), use_container_width=True)
+else:
+    st.info("첫 20문장의 검증이 끝나면 그래프에 두 방식의 첫 점이 표시돼요.")
+st.caption("전체 검증 완료 문장 기준 누적 집계")
 st.dataframe(summary, hide_index=True)
 with st.expander("임계값별 정확도 · 오탐 · 미탐 · 유보"):
     st.dataframe(pd.DataFrame([
