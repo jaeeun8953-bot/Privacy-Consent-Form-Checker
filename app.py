@@ -6,7 +6,7 @@ import pandas as pd
 import streamlit as st
 
 from similarity import BLACK, WHITE
-from validation import FILE_COUNT, METHODS, sample_bytes, sample_name, validate
+from validation import FILE_COUNT, METHODS, THRESHOLDS, sample_bytes, sample_name, validate
 
 
 def api_error_message(error):
@@ -27,8 +27,8 @@ st.set_page_config(page_title="개인정보 동의서 검증", layout="wide")
 st.title("개인정보 동의서 위험 문장 검증")
 st.caption("TF-IDF·코사인 유사도와 GPT에 같은 검증 파일을 넣어 비교해요. 파일 20개에 가상 문장 100개씩 있으며, 각각 안전 50개와 위험 50개예요.")
 
-history = st.session_state.setdefault("research_history", [])
-details = st.session_state.setdefault("research_details", {})
+history = st.session_state.setdefault("research_average_history", [])
+details = st.session_state.setdefault("research_average_details", {})
 with st.expander("유사도 판정 기준과 기준 문장"):
     st.markdown(
         "TF-IDF로 문장을 벡터로 바꾼 뒤, 코사인 유사도로 비교해요. "
@@ -46,10 +46,8 @@ with st.expander("유사도 판정 기준과 기준 문장"):
         for phrase in BLACK:
             st.text(phrase)
 
-a, b = st.columns(2)
-white_threshold = a.slider("화이트리스트 임계값", 0.05, 0.95, 0.30, 0.05, disabled=bool(history))
-black_threshold = b.slider("블랙리스트 임계값", 0.05, 0.95, 0.20, 0.05, disabled=bool(history))
-st.caption("한 회차의 모든 파일에는 같은 임계값을 적용해요. 다른 값으로 비교하려면 새로 검증을 시작할 수 있어요.")
+st.markdown("**유사도 검증 임계값 · 20%, 40%, 60%, 80%**")
+st.caption("각 회차에 화이트리스트와 블랙리스트에 같은 임계값을 적용해요. 파일별 유사도 점은 (20% 정확도 + 40% 정확도 + 60% 정확도 + 80% 정확도) ÷ 4예요. GPT는 파일당 한 번 평가해요.")
 
 st.progress(len(history) / FILE_COUNT, text=f"검증 완료 {len(history)}/{FILE_COUNT}개")
 if len(history) < FILE_COUNT:
@@ -66,7 +64,7 @@ if len(history) < FILE_COUNT:
         else:
             try:
                 with st.spinner("두 방식으로 문장 100개를 검증하고 있어요…"):
-                    result, rows = validate(number, key, white_threshold, black_threshold)
+                    result, rows = validate(number, key)
             except HTTPError as error:
                 st.error(api_error_message(error))
             except (OSError, TimeoutError, ValueError, KeyError):
@@ -86,14 +84,16 @@ if history:
         x=alt.X("파일 번호:Q", scale=alt.Scale(domain=[1, FILE_COUNT]), axis=alt.Axis(values=list(range(1, FILE_COUNT + 1)))),
         y=alt.Y("정확도 (%):Q", scale=alt.Scale(domain=[0, 100])),
         color=alt.Color("방식:N", scale=alt.Scale(domain=METHODS, range=["#235aa6", "#aa4d14"])),
-        tooltip=["파일 번호", "방식", "정확도 (%)"],
+        tooltip=["파일 번호", "방식", alt.Tooltip("정확도 (%):Q", format=".2f")],
     )
     st.altair_chart(chart, use_container_width=True)
+    st.dataframe(table[["파일 번호", *METHODS, *(f"{percent}% 정확도" for percent in THRESHOLDS)]], hide_index=True)
     with st.expander("파일별 오탐 · 미탐 · 판단 유보"):
         st.caption("오탐은 안전 문장을 위험으로 판정한 경우예요. 미탐은 위험 문장을 안전으로 판정하거나 판단을 유보한 경우예요.")
         st.dataframe(table, hide_index=True)
     file_number = st.selectbox("문장별 비교 파일", sorted(details), index=len(details) - 1)
-    rows = details[file_number]
+    percent = st.selectbox("문장별 비교 임계값", THRESHOLDS, format_func=lambda value: f"{value}%")
+    rows = details[file_number][percent]
     different, same, pending = st.tabs(["다르게 판단", "같게 판단", "판단 유보"])
     for tab, matches in [
         (different, [r for r in rows if r["유사도 판단"] != "판단 유보" and r["유사도 판단"] != r["GPT 판단"]]),

@@ -58,7 +58,8 @@ RISK_ALTERNATIVES = [
     "{case}에서 받은 전화번호를 별도 고지 없이 다른 목적으로 사용합니다.",
     "{case}에 필요한 고유식별정보는 별도의 동의 없이 일괄 수집합니다.",
 ]
-METHODS = ["TF-IDF + 코사인 유사도", "GPT 방식"]
+THRESHOLDS = (20, 40, 60, 80)
+METHODS = ["TF-IDF + 코사인 유사도 평균", "GPT 방식"]
 FILE_COUNT = len(CONTEXTS)
 GPT_FORMAT = {
     "type": "json_schema", "name": "validation_predictions", "strict": True,
@@ -124,28 +125,36 @@ def gpt_predictions(sentences, key):
     return [labels[i] for i in range(1, len(sentences) + 1)]
 
 
-def validate(number, key, white_threshold, black_threshold):
+def evaluate(truth, labels):
+    pairs = list(zip(truth, labels, strict=True))
+    return {
+        "정확도": 100 * sum(actual == predicted for actual, predicted in pairs) / len(pairs),
+        "오탐": pairs.count(("안전", "위험")),
+        "미탐": pairs.count(("위험", "안전")) + pairs.count(("위험", "판단 유보")),
+        "유보": labels.count("판단 유보"),
+    }
+
+
+def validate(number, key):
     examples = load_examples(number)
     sentences = [row["sentence"] for row in examples]
     truth = [row["label"] for row in examples]
     similarities = score(sentences)
-    similarity_labels = [
-        classify(white, black, white_threshold, black_threshold)
-        for white, black, *_ in similarities
-    ]
     gpt = gpt_predictions(sentences, key)
-    result = {"파일 번호": number, "화이트 임계값": white_threshold, "블랙 임계값": black_threshold}
-    for method, labels in zip(METHODS, (similarity_labels, gpt)):
-        pairs = list(zip(truth, labels))
-        result[method] = 100 * sum(actual == predicted for actual, predicted in pairs) / len(truth)
-        result[f"{method} 오탐"] = pairs.count(("안전", "위험"))
-        result[f"{method} 미탐"] = pairs.count(("위험", "안전")) + pairs.count(("위험", "판단 유보"))
-        result[f"{method} 유보"] = labels.count("판단 유보")
-    details = [
-        {"행": i, "원문": text, "정답": actual, "유사도 판단": similarity, "GPT 판단": label,
-         "화이트 최고": round(scores[0], 3), "블랙 최고": round(scores[1], 3)}
-        for i, (text, actual, similarity, label, scores) in enumerate(
-            zip(sentences, truth, similarity_labels, gpt, similarities), 1
-        )
-    ]
+    gpt_metrics = evaluate(truth, gpt)
+    result = {"파일 번호": number, METHODS[1]: gpt_metrics.pop("정확도")}
+    result.update({f"GPT {metric}": value for metric, value in gpt_metrics.items()})
+    details = {}
+    for percent in THRESHOLDS:
+        threshold = percent / 100
+        labels = [classify(white, black, threshold, threshold) for white, black, *_ in similarities]
+        result.update({f"{percent}% {metric}": value for metric, value in evaluate(truth, labels).items()})
+        details[percent] = [
+            {"행": i, "원문": text, "정답": actual, "유사도 판단": predicted, "GPT 판단": gpt_label,
+             "화이트 최고": round(scores[0], 3), "블랙 최고": round(scores[1], 3)}
+            for i, (text, actual, predicted, gpt_label, scores) in enumerate(
+                zip(sentences, truth, labels, gpt, similarities, strict=True), 1
+            )
+        ]
+    result[METHODS[0]] = sum(result[f"{percent}% 정확도"] for percent in THRESHOLDS) / len(THRESHOLDS)
     return result, details
