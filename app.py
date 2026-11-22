@@ -1,199 +1,110 @@
-"""Pilot evaluation of staged similarity and GPT-5."""
+"""Evaluate the recovered original corpus; compare historical aggregate results."""
 import csv
+import io
+import json
 from hashlib import sha256
-from io import StringIO
 from pathlib import Path
-from statistics import mean
-from time import perf_counter
 from urllib.error import HTTPError
 
-import altair as alt
 import pandas as pd
 import streamlit as st
+from model_study import STUDY_MODEL, PROMPT, measure, parse_csv, summarize
 
-from model_study import STUDY_MODEL, measure, summarize
-from similarity import BLACK, WHITE, classify, reference_vectors, score
-
-BATCH_SIZE = 20
-THRESHOLDS = (20, 40, 60, 80)
-SIMILARITY = "TF-IDF + 코사인 유사도"
-GPT = "GPT-5"
-
-
-def measure_similarity(sentence):
-    start = perf_counter()
-    white, black, white_match, black_match = score([sentence])[0]
-    predictions = {f"유사도 {percent}%": classify(white, black, percent / 100, percent / 100)
-                   for percent in THRESHOLDS}
-    return {
-        **predictions, "유사도 시간(초)": perf_counter() - start,
-        "화이트 최고": white, "블랙 최고": black,
-        "화이트 근접 표현": white_match, "블랙 근접 표현": black_match,
-    }
-
-
-def metrics(frame, method):
-    pred = frame[method]
-    truth = frame["정답"]
-    counts = summarize([{"정답": row["정답"], "예측": row[method], "응답 시간(초)": row["GPT 시간(초)" if method == "GPT" else "유사도 시간(초)"]}
-                        for row in frame.to_dict("records")])
-    counts["미탐"] += int(((truth == "위험") & (pred == "판단 유보")).sum())
-    counts["유보"] = int((pred == "판단 유보").sum())
-    return counts
-
-
-def average_similarity(frame):
-    per_threshold = [metrics(frame, f"유사도 {percent}%") for percent in THRESHOLDS]
-    return {field: mean(result[field] for result in per_threshold) for field in per_threshold[0]}
-
-
-st.set_page_config(page_title="개인정보 동의서 후속연구", layout="wide")
-st.title("개인정보 동의서 위험 문장 검증")
-st.caption("새 가상 문장 200개에서 화이트리스트 → 블랙리스트 기반 TF-IDF·코사인 유사도와 GPT-5를 비교해요.")
-data = Path(__file__).with_name("pilot_samples_200.csv").read_bytes()
-examples = list(csv.DictReader(StringIO(data.decode("utf-8-sig"), newline="")))
-st.download_button("검증 데이터 200개 CSV", data, "pilot_samples_200.csv", mime="text/csv")
-with st.expander("검증 데이터와 기준 목록"):
-    st.write("10개 유형별로 안전 10개와 위험 10개를 만들었어요. 유형마다 안전·위험 표현 5쌍을 만들고 온라인 신청과 방문 접수에 적용했어요.")
-    st.dataframe(pd.DataFrame(examples).groupby(["category", "label"]).size().unstack().reset_index().rename(columns={"category": "유형"}), hide_index=True)
-    a, b = st.columns(2)
-    a.write("화이트리스트 · 100개")
-    a.dataframe(pd.DataFrame({"기준 표현": WHITE}), hide_index=True)
-    b.write("블랙리스트 · 100개")
-    b.dataframe(pd.DataFrame({"기준 표현": BLACK}), hide_index=True)
-
-session_key = (sha256(data).hexdigest(), STUDY_MODEL)
-if st.session_state.get("pilot_source") != session_key:
-    st.session_state.pilot_source = session_key
-    st.session_state.pilot_results = []
-results = st.session_state.pilot_results
-st.caption("유사도 정확도는 화이트·블랙 공통 임계값 20·40·60·80%에서 각각 채점한 뒤 네 값의 평균으로 표시해요.")
-progress = st.progress(len(results) / len(examples), text=f"{len(results)}/{len(examples)}문장 검증 완료")
-if len(results) < len(examples):
-    count = min(BATCH_SIZE - len(results) % BATCH_SIZE, len(examples) - len(results))
-    st.caption("가상 문장만 문장당 한 번 API에 보내요. 정답 라벨은 앱에서 채점하며 API 이용료가 발생할 수 있어요.")
-    if st.button(f"다음 {count}문장 검증", type="primary"):
+st.set_page_config(page_title="개인정보 동의서 2,000문장 비교", layout="wide")
+st.title("동일한 2,000문장에서 세 방식 비교")
+st.caption("유사도 기반·GPT-3는 기존 실험 결과, GPT-5는 복원한 원본 문장으로 새로 평가합니다.")
+source = st.file_uploader("평가 데이터 CSV (sentence,label · 안전/위험 또는 0/1)", type=["csv"])
+data = source.getvalue() if source else Path(__file__).with_name("original_samples_2000.csv").read_bytes()
+try:
+    reader = csv.DictReader(io.StringIO(data.decode("utf-8-sig")))
+    if not {"sentence", "label"}.issubset(reader.fieldnames or []):
+        raise ValueError("CSV 열 이름은 sentence,label이어야 합니다.")
+    buf = io.StringIO(); writer = csv.DictWriter(buf, fieldnames=["sentence", "label"]); writer.writeheader()
+    for row in reader:
+        writer.writerow({"sentence": row["sentence"], "label": {"0": "안전", "1": "위험"}.get(row["label"].strip(), row["label"].strip())})
+    examples = parse_csv(buf.getvalue().encode("utf-8-sig"))
+except (ValueError, UnicodeError, KeyError, AttributeError) as exc:
+    st.error(str(exc)); st.stop()
+corpus_hash = sha256(json.dumps(examples, ensure_ascii=False).encode()).hexdigest()
+protocol_hash = sha256((STUDY_MODEL + PROMPT).encode()).hexdigest()
+default_hash = Path(__file__).with_name("original_corpus_hash.txt").read_text().strip()
+is_original = corpus_hash == default_hash
+if not is_original:
+    st.warning("기본 원본과 다른 데이터입니다. 이 데이터에는 과거 두 방식의 수치를 함께 표시하지 않습니다.")
+counts = pd.Series([r["label"] for r in examples]).value_counts()
+st.write(f"총 {len(examples):,}문장 · 안전 {counts.get('안전', 0):,} · 위험 {counts.get('위험', 0):,}")
+st.download_button("평가 데이터 CSV 저장", data, "evaluation-data.csv", "text/csv")
+with st.expander("평가 조건"):
+    st.write(f"요청 모델: {STUDY_MODEL}. 문장당 한 번 요청하며 정답은 API에 보내지 않습니다.")
+    st.code(PROMPT)
+    st.caption("동일한 문장을 사용하지만 과거 프롬프트·실행 환경까지 동일하게 재현한 실험은 아닙니다. 처리 시간에는 API 왕복 시간이 포함됩니다.")
+if st.session_state.get("original_source") != (corpus_hash, protocol_hash):
+    st.session_state.original_source = (corpus_hash, protocol_hash)
+    st.session_state.original_results = []
+results = st.session_state.original_results
+resume = st.file_uploader("이전에 저장한 문장별 결과 CSV로 이어하기", type=["csv"], key="resume")
+if resume and st.button("저장 결과 불러오기"):
+    try:
+        saved = list(csv.DictReader(io.StringIO(resume.getvalue().decode("utf-8-sig"))))
+        if not saved or len(saved) > len(examples): raise ValueError("결과 수가 올바르지 않습니다.")
+        restored = []
+        for i, r in enumerate(saved):
+            if r["데이터 해시"] != corpus_hash or r["평가 설정 해시"] != protocol_hash: raise ValueError("데이터 또는 평가 설정이 다릅니다.")
+            if r["원문"] != examples[i]["sentence"] or r["정답"] != examples[i]["label"] or r["예측"] not in ("안전", "위험"): raise ValueError("문장 순서 또는 판정이 올바르지 않습니다.")
+            seconds = float(r["응답 시간(초)"])
+            if not 0 <= seconds < 86400: raise ValueError("처리 시간이 올바르지 않습니다.")
+            r["응답 시간(초)"] = seconds; restored.append(r)
+        st.session_state.original_results = restored; st.rerun()
+    except (ValueError, KeyError, UnicodeError) as exc: st.error(f"결과를 불러올 수 없습니다: {exc}")
+progress = st.progress(len(results)/len(examples), text=f"{len(results)}/{len(examples)}문장 완료")
+size = st.selectbox("이번에 실행할 문장 수", [20, 100, 200], index=0)
+st.caption("실행 시 API 이용료가 발생합니다. 문장당 한 번 요청하므로 200문장 실행에도 시간이 걸릴 수 있습니다. 실행 후 CSV를 저장하면 세션이 종료돼도 이어갈 수 있습니다.")
+if len(results) < len(examples) and st.button(f"다음 {min(size, len(examples)-len(results))}문장 평가", type="primary"):
+    try: key = st.secrets.get("OPENAI_API_KEY", "")
+    except (FileNotFoundError, KeyError): key = ""
+    if not key: st.error("Streamlit Secrets의 OPENAI_API_KEY를 설정해 주세요.")
+    else:
         try:
-            key = st.secrets.get("OPENAI_API_KEY", "")
-        except FileNotFoundError:
-            key = ""
-        if not key:
-            st.warning("Streamlit Secrets의 OPENAI_API_KEY를 확인해 주세요.")
-        else:
-            try:
-                reference_vectors()
-                for sample in examples[len(results):len(results) + count]:
-                    result = measure(sample, key)
-                    results.append({"원문": result["원문"], "정답": result["정답"], "GPT": result["예측"],
-                                    "GPT 시간(초)": result["응답 시간(초)"], "응답 모델": result["모델"],
-                                    "유형": sample["category"], "문장 쌍": sample["pair_id"],
-                                    **measure_similarity(sample["sentence"])})
-                    progress.progress(len(results) / len(examples), text=f"{len(results)}/{len(examples)}문장 검증 완료")
-            except (HTTPError, OSError, ValueError, KeyError) as error:
-                st.error(f"검증이 중단됐어요 ({getattr(error, 'code', type(error).__name__)}). 남은 문장부터 이어갈 수 있어요.")
-            else:
-                st.rerun()
-
-st.subheader("정확도와 문장당 평균 처리 시간")
-if not results:
-    st.info("첫 검증을 실행하면 두 방식의 실측 결과가 표시돼요.")
-    st.stop()
-reference_vectors()
-for row in results:
-    if "유사도 시간(초)" not in row:
-        row.update(measure_similarity(row["원문"]))
-table = pd.DataFrame(results)
-summary = pd.DataFrame([
-    {"방식": SIMILARITY, **average_similarity(table)},
-    {"방식": GPT, **metrics(table, "GPT")},
-])
-st.caption(f"두 방식이 모두 처리한 {len(table)}문장 기준 · 응답 모델 {results[-1]['응답 모델']}")
-st.caption("유사도는 기준 벡터 준비가 끝난 뒤 문장 하나를 벡터화하고 네 임계값에서 판정하는 전체 시간을 재요. GPT-5는 API 왕복 시간을 재므로 네트워크 시간도 포함돼요.")
-def completed_points(frame):
-    points = []
-    for end in range(BATCH_SIZE, len(frame) + 1, BATCH_SIZE):
-        batch = frame.iloc[end - BATCH_SIZE:end]
-        points.extend([
-            {"완료 문장 수": end, "방식": SIMILARITY, **average_similarity(batch)},
-            {"완료 문장 수": end, "방식": GPT, **metrics(batch, "GPT")},
-        ])
-    return points
-
-
-points = completed_points(table)
-st.caption("각 점은 해당 20문장의 결과예요. 예를 들어 X축 40의 점은 21~40번 문장을 집계한 값이에요.")
-if points:
-    chart_data = pd.DataFrame(points)
-    chart_data["범례"] = chart_data["방식"].map({SIMILARITY: "유사도", GPT: "GPT-5"})
-    a, b = st.columns(2)
-    for column, metric, title, scale in [
-        (a, "정확도", "정확도 (%)", alt.Scale(domain=[0, 100])),
-        (b, "문장당 시간(초)", "문장당 평균 처리 시간 (초)", alt.Scale(zero=True)),
-    ]:
-        column.markdown(f"**{title}**")
-        chart = alt.Chart(chart_data).mark_line(point=alt.OverlayMarkDef(filled=True, size=75)).encode(
-            x=alt.X("완료 문장 수:Q", title=None,
-                    axis=alt.Axis(values=list(range(BATCH_SIZE, len(examples) + 1, BATCH_SIZE)),
-                                  format="d", labelAngle=-45, labelPadding=5, labelOverlap=True),
-                    scale=alt.Scale(domain=[BATCH_SIZE, len(examples)], nice=False)),
-            y=alt.Y(f"{metric}:Q", title=None, scale=scale),
-            color=alt.Color("범례:N", title=None,
-                            legend=alt.Legend(orient="top", direction="horizontal", labelLimit=100, offset=10),
-                            scale=alt.Scale(domain=["유사도", "GPT-5"], range=["#235aa6", "#aa4d14"])),
-            tooltip=["완료 문장 수:Q", "방식:N", alt.Tooltip(f"{metric}:Q", title=title, format=".4f")],
-        ).properties(height=270, padding={"left": 16, "top": 12, "right": 20, "bottom": 16})
-        column.altair_chart(chart, use_container_width=True)
-        column.caption("X축 · 완료 문장 수")
-
-else:
-    st.info("첫 20문장의 검증이 끝나면 그래프에 두 방식의 첫 점이 표시돼요.")
-st.caption("전체 검증 완료 문장 기준 누적 집계")
-st.dataframe(summary, hide_index=True)
-with st.expander("임계값별 정확도 · 오탐 · 미탐 · 유보"):
-    st.dataframe(pd.DataFrame([
-        {"임계값": f"{percent}%", **metrics(table, f"유사도 {percent}%")} for percent in THRESHOLDS
-    ]).drop(columns="문장당 시간(초)"), hide_index=True)
-st.caption("유사도의 오탐·미탐·유보도 네 조건의 평균 건수예요. 판단 유보는 정확도에서 오답으로 집계해요. 위험 문장을 유보하면 미탐에도 포함해요.")
-complete_batches = len(table) // BATCH_SIZE
-if complete_batches:
-    st.subheader("20문장 묶음별 상세 결과")
-    batch_number = st.selectbox(
-        "검증 묶음",
-        range(1, complete_batches + 1),
-        index=complete_batches - 1,
-        format_func=lambda n: f"{n}차 · {(n - 1) * BATCH_SIZE + 1}~{n * BATCH_SIZE}번",
-        key=f"pilot_detail_batch_{complete_batches}",
-    )
-    start = (batch_number - 1) * BATCH_SIZE
-    batch = table.iloc[start:start + BATCH_SIZE].copy()
-    batch.insert(0, "문장 번호", range(start + 1, start + len(batch) + 1))
-    st.markdown("**유형별 결과**")
-    st.dataframe(pd.DataFrame([
-        {"유형": category, "검증 문장": len(group), "방식": label, **result}
-        for category, group in batch.groupby("유형", sort=False)
-        for label, result in [(SIMILARITY, average_similarity(group)), (GPT, metrics(group, "GPT"))]
-    ]), hide_index=True)
-    st.markdown("**문장별 판단과 오탐·미탐**")
-    percent = st.selectbox("문장별 유사도 판정을 볼 임계값", THRESHOLDS, format_func=lambda value: f"{value}%")
-    prediction_column = f"유사도 {percent}%"
-    for label, prediction in [("유사도", prediction_column), ("GPT", "GPT")]:
-        batch[f"{label} 오류"] = [
-            "오탐" if actual == "안전" and predicted == "위험"
-            else "미탐 · 판단 유보" if actual == "위험" and predicted == "판단 유보"
-            else "미탐" if actual == "위험" and predicted == "안전"
-            else "판단 유보" if predicted == "판단 유보"
-            else "—"
-            for actual, predicted in zip(batch["정답"], batch[prediction], strict=True)
-        ]
-    columns = ["문장 번호", "유형", "원문", "정답", prediction_column, "유사도 오류", "GPT", "GPT 오류"]
-    different, same, errors = st.tabs(["다르게 판단", "같게 판단", "오탐·미탐·유보"])
-    with different:
-        st.dataframe(batch.loc[batch[prediction_column] != batch["GPT"], columns], hide_index=True)
-    with same:
-        st.dataframe(batch.loc[batch[prediction_column] == batch["GPT"], columns], hide_index=True)
-    with errors:
-        st.dataframe(batch.loc[(batch["정답"] != batch[prediction_column]) | (batch["정답"] != batch["GPT"]), columns], hide_index=True)
-else:
-    st.info("20문장 검증을 마치면 해당 묶음의 유형별 결과와 오탐·미탐 사례를 볼 수 있어요.")
-
-st.download_button("전체 문장별 결과 CSV 저장", table.to_csv(index=False).encode("utf-8-sig"), "pilot-results.csv", mime="text/csv")
+            for sample in examples[len(results):len(results)+size]:
+                result = measure(sample, key)
+                result.update({"데이터 해시": corpus_hash, "평가 설정 해시": protocol_hash})
+                results.append(result)
+                progress.progress(len(results)/len(examples), text=f"{len(results)}/{len(examples)}문장 완료")
+        except (HTTPError, OSError, ValueError, KeyError, TimeoutError):
+            st.error("평가가 중단됐습니다. 완료된 결과를 저장하고 남은 문장부터 이어갈 수 있습니다.")
+        else: st.rerun()
+if results:
+    table = pd.DataFrame(results)
+    st.download_button("문장별 결과 CSV 저장 · 이어하기용", table.to_csv(index=False).encode("utf-8-sig"), "gpt5-original-results.csv", "text/csv")
+    stats = summarize(results)
+    st.metric("GPT-5 정확도" + (" · 중간 결과" if len(results)<len(examples) else " · 최종"), f"{stats['정확도']:.2f}%")
+    st.write(f"오탐 {stats['오탐']}건 · 미탐 {stats['미탐']}건 · 문장당 API 왕복 시간 {stats['문장당 시간(초)']:.4f}초")
+    if is_original and len(results) == len(examples):
+        comparison = pd.DataFrame({"방식": ["유사도 기반", "GPT-3", "GPT-5"], "정확도 (%)": [68.78, 76.05, stats["정확도"]], "결과 구분": ["기존 실험", "기존 실험", "이번 실측"]})
+        st.subheader("동일한 2,000문장 · 분류 정확도 비교")
+        st.bar_chart(comparison, x="방식", y="정확도 (%)", sort=False)
+        st.dataframe(comparison, hide_index=True)
+        comparison["문장당 평균 처리 시간 (초)"] = [0.02, 59.0, stats["문장당 시간(초)"]]
+        st.subheader("문장당 평균 처리 시간 비교")
+        import altair as alt
+        speed_chart = alt.Chart(comparison).mark_bar().encode(
+            x=alt.X("방식:N", sort=["유사도 기반", "GPT-3", "GPT-5"], title=None),
+            y=alt.Y("문장당 평균 처리 시간 (초):Q", scale=alt.Scale(type="log"), title="문장당 평균 처리 시간 (초 · 로그 축)"),
+            color=alt.Color("방식:N", legend=None),
+            tooltip=["방식:N", alt.Tooltip("문장당 평균 처리 시간 (초):Q", format=".5f"), "결과 구분:N"],
+        )
+        st.altair_chart(speed_chart, use_container_width=True)
+        st.dataframe(comparison[["방식", "문장당 평균 처리 시간 (초)", "결과 구분"]], hide_index=True)
+        st.caption("시간이 짧을수록 빠릅니다. 차이가 커 로그 축으로 표시했습니다. 유사도 0.02초·GPT-3 59초는 과거 실험 기록, GPT-5는 이번 문장별 API 왕복 시간의 평균입니다. 측정 시점·환경·호출 조건이 달라 모델 자체의 속도 향상률로 해석하지 않습니다.")
+        st.download_button("세 방식 비교 CSV 저장", comparison.to_csv(index=False).encode("utf-8-sig"), "three-method-comparison.csv", "text/csv")
+    elif is_original: st.info("2,000문장을 모두 평가하면 과거 두 방식과 비교하는 그래프가 표시됩니다.")
+    points = [{"완료 문장 수": n, "누적 정확도 (%)": summarize(results[:n])["정확도"]} for n in range(20, len(results)+1, 20)]
+    if points:
+        st.subheader("GPT-5 누적 정확도")
+        st.line_chart(pd.DataFrame(points), x="완료 문장 수", y="누적 정확도 (%)")
+        st.subheader("GPT-5 누적 평균 처리 시간")
+        time_points = [{"완료 문장 수": n, "누적 평균 처리 시간 (초)": summarize(results[:n])["문장당 시간(초)"]} for n in range(20, len(results)+1, 20)]
+        st.line_chart(pd.DataFrame(time_points), x="완료 문장 수", y="누적 평균 처리 시간 (초)")
+    with st.expander("문장별 결과"):
+        st.dataframe(table.drop(columns=["데이터 해시", "평가 설정 해시"]), hide_index=True)
+else: st.info("기본 원본 2,000문장이 준비됐습니다. 다음 문장 평가를 눌러 시작하세요.")
