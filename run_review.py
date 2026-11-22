@@ -23,15 +23,17 @@ INSTRUCTIONS = """한국의 개인정보 수집·이용 및 제3자 제공 동�
 입력값에 포함된 이름, 연락처 등 개인 식별값은 결과에서 반복하지 않는다.
 법 위반을 단정하거나 근거를 지어내지 않는다. 동의서가 아니면 그 사실을 알린다."""
 
-def request_review(document, key):
+def request_review(document, key, *, instructions=INSTRUCTIONS, response_format=None):
     numbered = "\n".join(f"{i} | {line}" for i, line in enumerate(document.splitlines(), 1))
     body = {
         "model": MODEL,
-        "instructions": INSTRUCTIONS,
+        "instructions": instructions,
         "input": numbered,
         "max_output_tokens": 2800,
         "store": False,
     }
+    if response_format is not None:
+        body["text"] = {"format": response_format}
     request = Request(
         "https://api.openai.com/v1/responses",
         data=json.dumps(body).encode("utf-8"),
