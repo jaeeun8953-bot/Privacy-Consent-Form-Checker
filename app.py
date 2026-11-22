@@ -1,17 +1,18 @@
 """Streamlit entry point for the consent checker."""
 from hashlib import sha256
 from html import escape
-import csv
-from io import StringIO
 import json
 from pathlib import Path
 import subprocess
 from urllib.error import HTTPError, URLError
 
+import altair as alt
+import pandas as pd
 import streamlit as st
 
 from run_review import INSTRUCTIONS, request_review
-from similarity import BLACK, WHITE, BENCHMARK, classify, metrics, score
+from similarity import BLACK, WHITE, classify, score
+from validation import FILE_COUNT, sample_file, validate
 
 PAGE = Path(__file__).with_name("index.html")
 MAX_LENGTH = 30_000
@@ -234,39 +235,52 @@ def comparison_panel(document, results):
             st.markdown("**블랙리스트 · 위험 예시**")
             for example in BLACK:
                 st.text(example)
-    accuracy_panel(threshold)
 
 
-def accuracy_panel(selected):
-    st.subheader("임계값별 유사도 정확도")
-    st.caption("기본 그래프는 기준 목록과 별도로 만든 테스트용 문장 20개(안전 10개, 위험 10개) 결과예요. 판단 유보도 전체 분모에 포함해요.")
-    examples = BENCHMARK
-    uploaded = st.file_uploader("내 검증 데이터로 바꾸기 · 선택", type=["csv"], help="UTF-8 CSV. 첫 줄은 sentence,label이고, label은 안전 또는 위험이에요.")
-    if uploaded:
-        try:
-            if uploaded.size > 2_000_000:
-                raise ValueError
-            reader = csv.DictReader(StringIO(uploaded.getvalue().decode("utf-8-sig")))
-            if not {"sentence", "label"}.issubset(reader.fieldnames or []):
-                raise ValueError
-            examples = [((row["sentence"] or "").strip(), (row["label"] or "").strip()) for row in reader]
-            references = set(WHITE + BLACK)
-            if not 1 <= len(examples) <= 10000 or any(
-                not sentence or sentence in references or label not in ("안전", "위험")
-                for sentence, label in examples
-            ):
-                raise ValueError
-        except ValueError:
-            st.error("기준 목록과 겹치지 않는 문장을 담은 UTF-8 CSV를 올려주세요. 열은 sentence,label, 라벨은 안전 또는 위험, 최대 10,000행이에요.")
-            return
-        st.caption(f"업로드한 라벨 데이터 {len(examples):,}개로 계산했어요. 검증 CSV는 GPT에 전송하지 않아요.")
-    thresholds = [round(i / 100, 2) for i in range(5, 81, 5)]
-    values = list(metrics(examples, thresholds))
-    selected_row = next(row for row in values if abs(row["임계값"] - selected) < 0.001)
-    st.metric(f"임계값 {selected:.2f} 정확도", f"{selected_row['정확도 (%)']:.1f}%")
-    st.line_chart({"임계값": thresholds, "정확도 (%)": [row["정확도 (%)"] for row in values]}, x="임계값", y="정확도 (%)")
-    with st.expander("임계값별 수치 · 오탐, 미탐, 판단 유보"):
-        st.dataframe(values, hide_index=True, width="stretch")
+def validation_panel():
+    st.subheader("규칙 방식과 GPT 방식의 정확도")
+    st.caption("검증 파일마다 정답 라벨이 있는 가상 문장 100개(안전 50개, 위험 50개)를 비교해요. 같은 문장 유형에 상황을 바꿔 만든 데이터이며, 문장 자체의 위험 신호만 평가해요.")
+    history = st.session_state.setdefault("validation_history", [])
+    completed = {item["파일 번호"] for item in history}
+    next_file = next((number for number in range(1, FILE_COUNT + 1) if number not in completed), None)
+    st.progress(len(history) / FILE_COUNT, text=f"검증 완료 {len(history)}/{FILE_COUNT}개")
+    if next_file is not None:
+        path = sample_file(next_file)
+        st.download_button("다음 검증 파일 받기", path.read_bytes(), path.name, mime="text/csv")
+        st.caption("검증 버튼을 누르면 이 파일의 가상 문장만 OpenAI API로 전송돼요. 정답 라벨은 전송하지 않으며, 요청당 API 비용이 발생할 수 있어요.")
+        if st.button(f"파일 {next_file:02} 검증", key="validate-next"):
+            try:
+                key = st.secrets.get("OPENAI_API_KEY", "")
+            except FileNotFoundError:
+                key = ""
+            if not key:
+                st.info("Streamlit Secrets에 OpenAI API 키가 필요해요.")
+            else:
+                try:
+                    with st.spinner(f"파일 {next_file:02}의 문장 100개를 두 방식으로 검증하고 있어요…"):
+                        row = validate(next_file, key, rule_engine())
+                except HTTPError as error:
+                    st.error(api_error_message(error))
+                except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+                    st.error("검증을 완료하지 못했어요. 같은 파일을 다시 검증할 수 있어요.")
+                else:
+                    history.append(row)
+                    st.rerun()
+    st.caption("정확도 = 정답과 일치한 문장 수 ÷ 100. 두 방식의 결과가 모두 도착해야 점이 추가돼요. 결과는 현재 앱 세션 동안 유지돼요.")
+    if not history:
+        st.info("첫 번째 파일을 검증하면 두 방식의 첫 점이 표시돼요.")
+        return
+    table = pd.DataFrame(history).sort_values("파일 번호")
+    chart_data = table.melt(id_vars=["파일 번호"], var_name="검사 방식", value_name="정확도 (%)")
+    chart = alt.Chart(chart_data).mark_line(point=alt.OverlayMarkDef(filled=True, size=80)).encode(
+        x=alt.X("파일 번호:Q", scale=alt.Scale(domain=[1, FILE_COUNT]), axis=alt.Axis(values=list(range(1, FILE_COUNT + 1)))),
+        y=alt.Y("정확도 (%):Q", scale=alt.Scale(domain=[0, 100])),
+        color=alt.Color("검사 방식:N", scale=alt.Scale(domain=["규칙 방식", "GPT 방식"], range=["#235aa6", "#aa4d14"])),
+        tooltip=["파일 번호", "검사 방식", "정확도 (%)"],
+    )
+    st.altair_chart(chart, use_container_width=True)
+    st.dataframe(table, hide_index=True, width="stretch")
+    st.download_button("검증 결과 CSV 저장", table.to_csv(index=False).encode("utf-8-sig"), "accuracy-results.csv", mime="text/csv")
 
 
 st.set_page_config(page_title="Privacy Consent Form Checker", layout="wide")
@@ -368,5 +382,7 @@ with right_panel:
 
 st.divider()
 comparison_panel(document, results)
+st.divider()
+validation_panel()
 
 st.caption("위험은 먼저 확인할 항목, 주의는 추가 확인할 항목이에요. 실제 동의 화면과 원문을 함께 확인하세요.")
